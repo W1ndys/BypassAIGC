@@ -61,3 +61,14 @@ Agent 在任务执行过程中发现的条目应遵循以下格式：
 - Instructions:
   - 前端构建: `cd package/frontend && npx vite build`
   - 需要先 `npm install` 安装依赖
+
+### 任务断点续传机制
+- Date: 2026-04-28
+- Context: Agent 在执行"断点续传"功能时发现
+- Category: 代码模式
+- Instructions:
+  - 项目有两个入口文件: `package/main.py`（打包入口）和 `package/backend/app/main.py`（开发入口），修改 startup 逻辑时两个都要改
+  - `optimization_service.py` 的 `start_optimization` 已支持断点续传：检查 `existing_segments` 跳过已完成段落
+  - `run_optimization` 函数定义在 `app/routes/optimization.py` 中，接收 `(session_id: int, db: Session)`
+  - Word 排版任务（`word_formatter`）数据完全存在内存中，重启后丢失，无法恢复
+  - 服务启动时通过 `_resume_interrupted_sessions()` 自动恢复 processing/queued 状态的优化会话
