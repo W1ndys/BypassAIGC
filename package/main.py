@@ -10,6 +10,7 @@ import webbrowser
 import threading
 import time
 import signal
+import asyncio
 from typing import Optional
 
 # 获取应用运行目录
@@ -57,9 +58,10 @@ from app.database import init_db
 from app.routes import admin, prompts, optimization
 from app.word_formatter import router as word_formatter_router
 from app.word_formatter.services import get_job_manager
-from app.models.models import CustomPrompt
+from app.models.models import CustomPrompt, OptimizationSession
 from app.database import SessionLocal
 from app.services.ai_service import get_default_polish_prompt, get_default_enhance_prompt
+from app.routes.optimization import run_optimization
 
 # 检查默认密钥（仅警告，不退出）
 if settings.SECRET_KEY == "your-secret-key-change-this-in-production":
@@ -165,6 +167,49 @@ async def startup_event():
             db.add(enhance_prompt)
         
         db.commit()
+    finally:
+        db.close()
+
+    # 恢复因服务重启而中断的任务
+    await _resume_interrupted_sessions()
+
+
+async def _resume_interrupted_sessions():
+    """服务启动时恢复因重启而中断的 processing/queued 任务"""
+    db = SessionLocal()
+    try:
+        interrupted = db.query(OptimizationSession).filter(
+            OptimizationSession.status.in_(["processing", "queued"])
+        ).all()
+
+        if not interrupted:
+            return
+
+        print(f"[启动恢复] 发现 {len(interrupted)} 个中断的任务，正在重新调度...")
+
+        for session in interrupted:
+            session.status = "queued"
+            session.error_message = "[自动恢复] 服务重启后断点续传"
+
+        db.commit()
+
+        for session in interrupted:
+            asyncio.create_task(_resume_single_session(session.id))
+
+        print(f"[启动恢复] 已重新调度 {len(interrupted)} 个任务")
+    except Exception as e:
+        print(f"[启动恢复] 恢复任务失败: {e}")
+    finally:
+        db.close()
+
+
+async def _resume_single_session(session_id: int):
+    """恢复单个中断的会话"""
+    db = SessionLocal()
+    try:
+        await run_optimization(session_id, db)
+    except Exception as e:
+        print(f"[启动恢复] 会话 {session_id} 恢复失败: {e}")
     finally:
         db.close()
 

@@ -28,7 +28,7 @@ const WordFormatterPage = () => {
   const [includeCover, setIncludeCover] = useState(true);
   const [includeToc, setIncludeToc] = useState(true);
   const [jobs, setJobs] = useState([]);
-  const [activeJob, setActiveJob] = useState(null);
+  const [activeJobs, setActiveJobs] = useState(new Set());
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isLoadingJobs, setIsLoadingJobs] = useState(false);
   const [usage, setUsage] = useState(null);
@@ -38,7 +38,7 @@ const WordFormatterPage = () => {
   const [showSampleCode, setShowSampleCode] = useState(false);
 
   const fileInputRef = useRef(null);
-  const eventSourceRef = useRef(null);
+  const eventSourcesRef = useRef(new Map());
 
   // Initialize with passed data
   useEffect(() => {
@@ -61,22 +61,27 @@ const WordFormatterPage = () => {
     loadUsage();
 
     return () => {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-      }
+      eventSourcesRef.current.forEach(es => es.close());
+      eventSourcesRef.current.clear();
     };
   }, []);
 
+  // 当 activeJobs 变化时，为新增的 job 启动 SSE，关闭已移除的 job 的 SSE
   useEffect(() => {
-    if (activeJob) {
-      startSSE(activeJob);
-    }
-    return () => {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
+    // 关闭不再活跃的 SSE
+    eventSourcesRef.current.forEach((es, jobId) => {
+      if (!activeJobs.has(jobId)) {
+        es.close();
+        eventSourcesRef.current.delete(jobId);
       }
-    };
-  }, [activeJob]);
+    });
+    // 为新增的活跃 job 启动 SSE
+    activeJobs.forEach(jobId => {
+      if (!eventSourcesRef.current.has(jobId)) {
+        startSSE(jobId);
+      }
+    });
+  }, [activeJobs]);
 
   const loadSpecs = async () => {
     try {
@@ -102,12 +107,10 @@ const WordFormatterPage = () => {
       const response = await wordFormatterAPI.listJobs(20);
       setJobs(response.data.jobs || []);
 
-      const processing = response.data.jobs?.find(
-        j => j.status === 'running' || j.status === 'pending'
-      );
-      if (processing) {
-        setActiveJob(processing.job_id);
-      }
+      const processingIds = (response.data.jobs || [])
+        .filter(j => j.status === 'running' || j.status === 'pending')
+        .map(j => j.job_id);
+      setActiveJobs(new Set(processingIds));
     } catch (error) {
       console.error('Load jobs failed:', error);
     } finally {
@@ -125,13 +128,14 @@ const WordFormatterPage = () => {
   };
 
   const startSSE = (jobId) => {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
+    // 如果已有该 job 的 SSE 连接，先关闭
+    if (eventSourcesRef.current.has(jobId)) {
+      eventSourcesRef.current.get(jobId).close();
     }
 
     const url = wordFormatterAPI.getStreamUrl(jobId);
     const es = new EventSource(url);
-    eventSourceRef.current = es;
+    eventSourcesRef.current.set(jobId, es);
 
     es.onmessage = (event) => {
       try {
@@ -155,7 +159,11 @@ const WordFormatterPage = () => {
       try {
         const data = JSON.parse(event.data);
         updateJobProgress(jobId, { status: 'completed', ...data });
-        setActiveJob(null);
+        setActiveJobs(prev => {
+          const next = new Set(prev);
+          next.delete(jobId);
+          return next;
+        });
         toast.success('Word 排版完成!');
         loadJobs();
         loadUsage();
@@ -169,7 +177,11 @@ const WordFormatterPage = () => {
       try {
         const data = JSON.parse(event.data);
         updateJobProgress(jobId, { status: 'failed', error: data.message });
-        setActiveJob(null);
+        setActiveJobs(prev => {
+          const next = new Set(prev);
+          next.delete(jobId);
+          return next;
+        });
         toast.error(`排版失败: ${data.message}`);
       } catch (e) {
         console.error('SSE error event:', e);
@@ -206,7 +218,7 @@ const WordFormatterPage = () => {
       toast.error('请选择文件');
       return;
     }
-    if (isSubmitting || activeJob) {
+    if (isSubmitting) {
       return;
     }
 
@@ -235,7 +247,7 @@ const WordFormatterPage = () => {
         });
       }
 
-      setActiveJob(response.data.job_id);
+      setActiveJobs(prev => new Set(prev).add(response.data.job_id));
       toast.success('任务已开始');
       setText('');
       setFile(null);
@@ -259,9 +271,11 @@ const WordFormatterPage = () => {
 
     try {
       await wordFormatterAPI.deleteJob(job.job_id);
-      if (activeJob === job.job_id) {
-        setActiveJob(null);
-      }
+      setActiveJobs(prev => {
+        const next = new Set(prev);
+        next.delete(job.job_id);
+        return next;
+      });
       toast.success('任务已删除');
       loadJobs();
     } catch (error) {
@@ -844,7 +858,7 @@ Deep Learning; Image Recognition; Convolutional Neural Network
               <div className="mt-5 flex justify-end">
                 <button
                   onClick={handleSubmit}
-                  disabled={(inputMode === 'text' && !text.trim()) || (inputMode === 'file' && !file) || activeJob || isSubmitting}
+                  disabled={(inputMode === 'text' && !text.trim()) || (inputMode === 'file' && !file) || isSubmitting}
                   className="flex items-center gap-2 bg-blue-500 hover:bg-blue-600 disabled:bg-gray-300 disabled:cursor-not-allowed text-white font-semibold py-3 px-8 rounded-xl transition-all active:scale-[0.98] shadow-sm text-[17px]"
                 >
                   {isSubmitting ? (
@@ -862,44 +876,48 @@ Deep Learning; Image Recognition; Convolutional Neural Network
               </div>
             </div>
 
-            {/* Active Job Progress */}
-            {activeJob && jobs.find(j => j.job_id === activeJob) && (
-              <div className="bg-white rounded-2xl shadow-ios p-5 border border-blue-100">
-                <div className="flex items-center justify-between mb-4">
-                  <h2 className="text-[17px] font-bold text-black flex items-center gap-2">
-                    <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
-                    处理中
-                  </h2>
-                  <span className="text-[13px] font-medium px-2 py-1 bg-blue-50 text-blue-600 rounded-md">
-                    {jobs.find(j => j.job_id === activeJob)?.phase || '运行中'}
-                  </span>
-                </div>
-
-                {(() => {
-                  const job = jobs.find(j => j.job_id === activeJob);
-                  return (
-                    <div className="space-y-4">
-                      <div>
-                        <div className="flex justify-between text-[13px] mb-2 font-medium">
-                          <span className="text-ios-gray">
-                            {job?.message || '正在处理文档...'}
-                          </span>
-                          <span className="text-blue-600">
-                            {((job?.progress || 0) * 100).toFixed(0)}%
-                          </span>
-                        </div>
-                        <div className="w-full bg-gray-100 rounded-full h-2">
-                          <div
-                            className="bg-blue-500 h-2 rounded-full transition-all duration-500 ease-out"
-                            style={{ width: `${(job?.progress || 0) * 100}%` }}
-                          />
+            {/* Active Jobs Progress */}
+            {(() => {
+              const activeJobsData = jobs.filter(j => activeJobs.has(j.job_id));
+              if (activeJobsData.length === 0) return null;
+              return (
+                <div className="space-y-4">
+                  {activeJobsData.map(job => (
+                    <div key={job.job_id} className="bg-white rounded-2xl shadow-ios p-5 border border-blue-100">
+                      <div className="flex items-center justify-between mb-4">
+                        <h2 className="text-[17px] font-bold text-black flex items-center gap-2">
+                          <div className={`w-2 h-2 rounded-full ${job.status === 'pending' ? 'bg-ios-orange' : 'bg-blue-500'} animate-pulse`} />
+                          {job.status === 'pending' ? '排队中' : '处理中'}
+                        </h2>
+                        <span className={`text-[13px] font-medium px-2 py-1 rounded-md ${
+                          job.status === 'pending' ? 'bg-orange-50 text-ios-orange' : 'bg-blue-50 text-blue-600'
+                        }`}>
+                          {job.status === 'pending' ? '等待中' : (job.phase || '运行中')}
+                        </span>
+                      </div>
+                      <div className="space-y-4">
+                        <div>
+                          <div className="flex justify-between text-[13px] mb-2 font-medium">
+                            <span className="text-ios-gray">
+                              {job.message || '正在处理文档...'}
+                            </span>
+                            <span className="text-blue-600">
+                              {((job.progress || 0) * 100).toFixed(0)}%
+                            </span>
+                          </div>
+                          <div className="w-full bg-gray-100 rounded-full h-2">
+                            <div
+                              className="bg-blue-500 h-2 rounded-full transition-all duration-500 ease-out"
+                              style={{ width: `${(job.progress || 0) * 100}%` }}
+                            />
+                          </div>
                         </div>
                       </div>
                     </div>
-                  );
-                })()}
-              </div>
-            )}
+                  ))}
+                </div>
+              );
+            })()}
           </div>
 
           {/* Right - History */}
